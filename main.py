@@ -73,8 +73,9 @@ def count_sent_ids():
 # ═══════════════════════════════════════════════
 # FETCH ALL POSTS FROM FACEBOOK PAGE
 # ═══════════════════════════════════════════════
-async def fetch_all_posts():
+async def fetch_all_posts(msg=None):
     all_posts = []
+    page_num  = 0
     url = (
         f"https://graph.facebook.com/v19.0/{PAGE_ID}/posts"
         f"?fields=id,message,story,created_time,full_picture,attachments"
@@ -99,6 +100,19 @@ async def fetch_all_posts():
 
             posts = data.get("data", [])
             all_posts.extend(posts)
+            page_num += 1
+
+            # ── Live progress update ──
+            if msg:
+                fetched = len(all_posts)
+                bar = "█" * page_num + "░" * max(0, 10 - page_num)
+                await msg.edit_text(
+                    f"⏳ <b>Fetching posts from Facebook...</b>\n\n"
+                    f"[{bar}]\n"
+                    f"📦 Pages fetched : <code>{page_num}</code>\n"
+                    f"📝 Posts so far  : <code>{fetched}</code>",
+                    parse_mode="HTML"
+                )
 
             paging = data.get("paging", {})
             url = paging.get("next")
@@ -328,12 +342,15 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["stop"] = False
 
     msg = await update.message.reply_text(
-        "⏳ <b>Fetching all posts from Facebook...</b>\nThis may take a moment.",
+        "⏳ <b>Fetching posts from Facebook...</b>\n\n"
+        "[░░░░░░░░░░]\n"
+        "📦 Pages fetched : <code>0</code>\n"
+        "📝 Posts so far  : <code>0</code>",
         parse_mode="HTML"
     )
 
     try:
-        all_posts = await fetch_all_posts()
+        all_posts = await fetch_all_posts(msg=msg)  # ← pass msg here
         sent_ids  = load_sent_ids()
 
         new_posts = [p for p in all_posts if p["id"] not in sent_ids]
@@ -353,8 +370,9 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await msg.edit_text(
-            f"✅ <b>Found {total_new} new post(s)!</b>\n"
-            f"⏭️ Skipping {skipped} already-sent post(s).\n\n"
+            f"✅ <b>Fetched {len(all_posts)} posts!</b>\n"
+            f"🆕 New to send   : <code>{total_new}</code>\n"
+            f"⏭️ Already sent  : <code>{skipped}</code>\n\n"
             f"📤 Sending oldest to newest...\nSend /stop anytime to pause.",
             parse_mode="HTML"
         )
