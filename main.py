@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
+import pytz
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ═══════════════════════════════════════════════
 # CONFIG — loaded from .env file
@@ -427,10 +429,99 @@ async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, st
     )
 
 # ═══════════════════════════════════════════════
+# AUTO DAILY FETCH — runs at 11:59 PM PH time
+# ═══════════════════════════════════════════════
+async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
+    """Automatically fetch and send new posts every night."""
+    chat_id = ADMIN_ID  # sends to admin's chat
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🌙 <b>Nightly Auto-Fetch Started</b>\n\n"
+             "[░░░░░░░░░░]\n"
+             "📦 Pages fetched : <code>0</code>\n"
+             "📝 Posts so far  : <code>0</code>",
+        parse_mode="HTML"
+    )
+
+    try:
+        all_posts = await fetch_all_posts(msg=msg)
+        sent_ids  = load_sent_ids()
+
+        new_posts = [p for p in all_posts if p["id"] not in sent_ids]
+        total_new = len(new_posts)
+        skipped   = len(all_posts) - total_new
+
+        context.bot_data["posts"]  = new_posts
+        context.bot_data["stop"]   = False
+
+        if total_new == 0:
+            await msg.edit_text(
+                f"🌙 <b>Nightly Auto-Fetch Done</b>\n\n"
+                f"✅ No new posts tonight.\n"
+                f"📦 Total posts: <code>{len(all_posts)}</code>\n"
+                f"⏭️ All <code>{skipped}</code> already sent.",
+                parse_mode="HTML"
+            )
+            return
+
+        await msg.edit_text(
+            f"🌙 <b>Nightly Auto-Fetch</b>\n\n"
+            f"✅ Found <code>{total_new}</code> new post(s)!\n"
+            f"⏭️ Skipping <code>{skipped}</code> already sent.\n\n"
+            f"📤 Sending now...",
+            parse_mode="HTML"
+        )
+
+        save_progress(0, total_new)
+
+        # Send all new posts
+        total = len(new_posts)
+        for i in range(total):
+            if context.bot_data.get("stop"):
+                save_progress(i, total)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏹️ Auto-fetch stopped at #{i + 1} of {total}.",
+                    parse_mode="HTML"
+                )
+                return
+
+            post = new_posts[i]
+            await send_post(context, chat_id, post, i + 1, total)
+            save_sent_id(post["id"])
+            save_progress(i + 1, total)
+            await asyncio.sleep(1.5)
+
+        clear_progress()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎉 <b>Nightly Auto-Fetch Complete!</b>\n\n"
+                 f"✅ Sent <code>{total_new}</code> new post(s).\n"
+                 f"🕛 Next run: tomorrow at 11:59 PM PH time.",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ <b>Nightly Auto-Fetch Failed</b>\n\n"
+                 f"⚠️ Error: <code>{str(e)[:200]}</code>",
+            parse_mode="HTML"
+        )
+
+# ═══════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # ── Schedule auto fetch at 11:59 PM PH time (UTC+8) ──
+    ph_tz = pytz.timezone("Asia/Manila")
+    app.job_queue.run_daily(
+        auto_get_posts,
+        time=datetime.now(ph_tz).replace(hour=23, minute=59, second=0).timetz()
+    )
 
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("getposts",    get_posts))
@@ -441,7 +532,7 @@ def main():
     app.add_handler(CommandHandler("reset",       reset))
     app.add_handler(CommandHandler("resetall",    reset_all))
 
-    print("🤖 Bot started!")
+    print("🤖 Bot started! Auto-fetch scheduled at 11:59 PM PH time.")
     app.run_polling()
 
 if __name__ == "__main__":
