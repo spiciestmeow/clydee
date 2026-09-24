@@ -385,8 +385,14 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Show preview with buttons instead of sending immediately
         first_post = new_posts[0]
         last_post = new_posts[-1]
-        oldest_date = first_post.get("created_time", "")[:10]
-        newest_date = last_post.get("created_time", "")[:10]
+        def fmt(dt_str):
+            if not dt_str:
+                return "N/A"
+            dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
+            return dt.strftime("%b %d, %Y %I:%M %p")
+
+        oldest_date = fmt(first_post.get("created_time", ""))
+        newest_date = fmt(last_post.get("created_time", ""))
 
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Yes, Send All", callback_data="confirm_send")],
