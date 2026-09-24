@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 import pytz
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -71,6 +72,25 @@ def clear_sent_ids():
 
 def count_sent_ids():
     res = supabase.table("clydee_sent_posts").select("post_id", count="exact").execute()
+    return res.count or 0
+
+def save_failed_post(post, reason="unknown"):
+    supabase.table("clydee_failed_posts").upsert({
+        "post_id": post["id"],
+        "post_data": json.dumps(post),
+        "failed_at": datetime.utcnow().isoformat(),
+        "reason": str(reason)[:300]
+    }).execute()
+
+def load_failed_posts():
+    res = supabase.table("clydee_failed_posts").select("*").execute()
+    return res.data or []
+
+def remove_failed_post(post_id):
+    supabase.table("clydee_failed_posts").delete().eq("post_id", post_id).execute()
+
+def count_failed_posts():
+    res = supabase.table("clydee_failed_posts").select("post_id", count="exact").execute()
     return res.count or 0
 
 # ═══════════════════════════════════════════════
@@ -183,6 +203,7 @@ async def send_post(context, chat_id, post, index, total):
             )
         except Exception as e2:
             print(f"[ERROR] Failed to send post #{index}: {e2}")
+            save_failed_post(post, reason=str(e2))
 
 # ═══════════════════════════════════════════════
 # TOKEN STATUS
@@ -257,8 +278,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status      — Check current progress\n"
         "/tokenstatus — Check Facebook token validity & expiry\n"
         "/stop        — Stop sending posts\n"
-        "/reset       — Reset in-progress session only\n"
-        "/resetall    — ⚠️ Forget ALL sent posts (start completely fresh)\n\n"
+        "/resetall    — ⚠️ Forget ALL sent posts (start completely fresh)\n"
+        "/retryfailed — 🔄 Retry all previously failed posts\n\n"
         "⚠️ <i>Only the admin can use these commands.</i>",
         parse_mode="HTML"
     )
@@ -288,7 +309,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Sent this session : <code>{last}</code> / <code>{total}</code>\n"
         f"📈 Progress          : <code>{pct}%</code>\n"
         f"⏳ Remaining         : <code>{total - last}</code> posts\n"
-        f"🗂️ All-time sent IDs : <code>{sent_count}</code>",
+        f"🗂️ All-time sent IDs : <code>{sent_count}</code>\n"
+        f"❌ Failed posts      : <code>{count_failed_posts()}</code>",
         parse_mode="HTML"
     )
 
@@ -554,6 +576,46 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
+async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    chat_id = update.effective_chat.id
+    failed  = load_failed_posts()
+
+    if not failed:
+        await update.message.reply_text("✅ No failed posts to retry!")
+        return
+
+    total = len(failed)
+    msg   = await update.message.reply_text(
+        f"🔄 <b>Retrying {total} failed post(s)...</b>",
+        parse_mode="HTML"
+    )
+
+    success      = 0
+    still_failed = 0
+
+    for i, row in enumerate(failed):
+        post = json.loads(row["post_data"])
+        try:
+            await send_post(context, chat_id, post, i + 1, total)
+            save_sent_id(post["id"])
+            remove_failed_post(post["id"])
+            success += 1
+        except Exception as e:
+            still_failed += 1
+
+        await asyncio.sleep(1.5)
+
+    await msg.edit_text(
+        f"🔄 <b>Retry Complete</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Successfully sent : <code>{success}</code>\n"
+        f"❌ Still failing     : <code>{still_failed}</code>",
+        parse_mode="HTML"
+    )
+
 # ═══════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════
@@ -575,6 +637,7 @@ def main():
     app.add_handler(CommandHandler("stop",        stop_posts))
     app.add_handler(CommandHandler("reset",       reset))
     app.add_handler(CommandHandler("resetall",    reset_all))
+    app.add_handler(CommandHandler("retryfailed", retry_failed))
 
     print("🤖 Bot started! Auto-fetch scheduled at 11:59 PM PH time.")
     app.run_polling()
