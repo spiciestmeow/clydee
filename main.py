@@ -8,6 +8,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 import pytz
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # ═══════════════════════════════════════════════
 # CONFIG — loaded from .env file
@@ -380,7 +381,29 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         save_progress(0, total_new)
-        await _send_all_posts(update, context, start_from=0)
+
+        # Show preview with buttons instead of sending immediately
+        first_post = new_posts[0]
+        last_post = new_posts[-1]
+        oldest_date = first_post.get("created_time", "")[:10]
+        newest_date = last_post.get("created_time", "")[:10]
+
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Send All", callback_data="confirm_send")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_send")]
+        ])
+
+        await msg.edit_text(
+            f"📋 <b>Preview</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆕 New posts found : <code>{total_new}</code>\n"
+            f"📅 Oldest : <code>{oldest_date}</code>\n"
+            f"📅 Newest : <code>{newest_date}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send all <code>{total_new}</code> posts?",
+            parse_mode="HTML",
+            reply_markup=markup
+        )
 
     except Exception as e:
         await msg.edit_text(
@@ -389,6 +412,18 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Make sure your Page Access Token is valid.",
             parse_mode="HTML"
         )
+
+async def confirm_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel_send":
+        await query.edit_message_text("❌ Cancelled. No posts were sent.")
+        return
+
+    if query.data == "confirm_send":
+        await query.edit_message_text("📤 Sending posts now...\nSend /stop anytime to pause.")
+        await _send_all_posts(update, context, start_from=0)
 
 async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, start_from: int):
     chat_id = update.effective_chat.id
@@ -522,7 +557,7 @@ def main():
         auto_get_posts,
         time=datetime.now(ph_tz).replace(hour=23, minute=59, second=0).timetz()
     )
-
+    app.add_handler(CallbackQueryHandler(confirm_send_callback, pattern="^confirm_send$|^cancel_send$"))
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("getposts",    get_posts))
     app.add_handler(CommandHandler("resume",      resume_posts))
