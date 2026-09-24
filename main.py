@@ -1,13 +1,13 @@
 import os
 import asyncio
 import aiohttp
+import pytz
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 import pytz
-from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # ═══════════════════════════════════════════════
@@ -385,11 +385,14 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Show preview with buttons instead of sending immediately
         first_post = new_posts[0]
         last_post = new_posts[-1]
+
         def fmt(dt_str):
             if not dt_str:
                 return "N/A"
+            ph_tz = pytz.timezone("Asia/Manila")
             dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
-            return dt.strftime("%b %d, %Y %I:%M %p")
+            dt_ph = dt.astimezone(ph_tz)
+            return dt_ph.strftime("%b %d, %Y %I:%M %p")
 
         oldest_date = fmt(first_post.get("created_time", ""))
         newest_date = fmt(last_post.get("created_time", ""))
