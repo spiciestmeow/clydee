@@ -185,25 +185,34 @@ async def send_post(context, chat_id, post, index, total):
 
     try:
         if image_url:
-            await context.bot.send_photo(
-                chat_id=chat_id, photo=image_url,
-                caption=caption, parse_mode="HTML", reply_markup=markup
-            )
+            # Download image first, then send
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=image_bytes,  # ← send bytes not URL
+                            caption=caption,
+                            parse_mode="HTML",
+                            reply_markup=markup
+                        )
+                    else:
+                        raise Exception(f"Image HTTP {resp.status}")
         else:
             await context.bot.send_message(
                 chat_id=chat_id, text=caption,
                 parse_mode="HTML", reply_markup=markup
             )
-    except Exception:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{caption}\n\n⚠️ <i>Image failed to load</i>",
-                parse_mode="HTML", reply_markup=markup
-            )
-        except Exception as e2:
-            print(f"[ERROR] Failed to send post #{index}: {e2}")
-            save_failed_post(post, reason=str(e2))
+    except Exception as e:
+        # Fallback — send as text only
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{caption}\n\n⚠️ <i>Image failed to load</i>",
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+        save_failed_post(post, reason=str(e))
 
 # ═══════════════════════════════════════════════
 # TOKEN STATUS
@@ -270,6 +279,14 @@ async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # COMMANDS
 # ═══════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "🔒 <b>Access Denied.</b>\n"
+            "This bot is private.",
+            parse_mode="HTML"
+        )
+        return
+
     await update.message.reply_text(
         "👋 <b>Facebook Page Post Bot</b>\n\n"
         "📋 <b>Commands:</b>\n"
@@ -364,6 +381,16 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
+    if context.bot_data.get("is_running"):
+        await update.message.reply_text(
+            "⚠️ <b>Already running!</b>\n"
+            "Posts are currently being sent.\n"
+            "Use /stop to pause first.",
+            parse_mode="HTML"
+        )
+        return
+
+    context.bot_data["is_running"] = True
     context.bot_data["stop"] = False
 
     msg = await update.message.reply_text(
@@ -385,6 +412,7 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["posts"] = new_posts
 
         if total_new == 0:
+            context.bot_data["is_running"] = False
             await msg.edit_text(
                 f"✅ <b>No new posts to send!</b>\n\n"
                 f"📦 Facebook has <code>{len(all_posts)}</code> posts total.\n"
@@ -393,14 +421,6 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-
-        await msg.edit_text(
-            f"✅ <b>Fetched {len(all_posts)} posts!</b>\n"
-            f"🆕 New to send   : <code>{total_new}</code>\n"
-            f"⏭️ Already sent  : <code>{skipped}</code>\n\n"
-            f"📤 Sending oldest to newest...\nSend /stop anytime to pause.",
-            parse_mode="HTML"
-        )
 
         save_progress(0, total_new)
 
@@ -437,6 +457,7 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
+        context.bot_data["is_running"] = False
         await msg.edit_text(
             f"❌ <b>Failed to fetch posts</b>\n\n"
             f"⚠️ Error: <code>{str(e)[:200]}</code>\n\n"
@@ -449,6 +470,7 @@ async def confirm_send_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if query.data == "cancel_send":
+        context.bot_data["is_running"] = False
         await query.edit_message_text("❌ Cancelled. No posts were sent.")
         return
 
@@ -470,6 +492,7 @@ async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, st
     for i in range(start_from, total):
         if context.bot_data.get("stop"):
             save_progress(i, total)
+            context.bot_data["is_running"] = False
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"⏹️ <b>Stopped at post #{i + 1} of {total}</b>\nUse /resume to continue.",
@@ -487,6 +510,7 @@ async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, st
         await asyncio.sleep(1.5)
 
     clear_progress()
+    context.bot_data["is_running"] = False
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"🎉 <b>All {total} new post(s) sent!</b>\n\n"
@@ -499,7 +523,18 @@ async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, st
 # ═══════════════════════════════════════════════
 async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
     """Automatically fetch and send new posts every night."""
-    chat_id = ADMIN_ID  # sends to admin's chat
+    chat_id = ADMIN_ID
+
+    if context.bot_data.get("is_running"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ <b>Nightly Auto-Fetch Skipped</b>\n\n"
+                 "A manual /getposts is already running.",
+            parse_mode="HTML"
+        )
+        return
+
+    context.bot_data["is_running"] = True
 
     msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -522,6 +557,7 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["stop"]   = False
 
         if total_new == 0:
+            context.bot_data["is_running"] = False
             await msg.edit_text(
                 f"🌙 <b>Nightly Auto-Fetch Done</b>\n\n"
                 f"✅ No new posts tonight.\n"
@@ -546,6 +582,7 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
         for i in range(total):
             if context.bot_data.get("stop"):
                 save_progress(i, total)
+                context.bot_data["is_running"] = False
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"⏹️ Auto-fetch stopped at #{i + 1} of {total}.",
@@ -560,6 +597,7 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1.5)
 
         clear_progress()
+        context.bot_data["is_running"] = False
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"🎉 <b>Nightly Auto-Fetch Complete!</b>\n\n"
@@ -569,6 +607,7 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
+        context.bot_data["is_running"] = False
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ <b>Nightly Auto-Fetch Failed</b>\n\n"
