@@ -11,6 +11,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import pytz
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
+
+import html, re
+from telegram.error import BadRequest
+
+def esc(x):
+    return html.escape(str(x or ""), quote=False)
+
+def strip_tags(s):
+    return html.unescape(re.sub(r"<[^>]+>", "", s))
+
 # ═══════════════════════════════════════════════
 # CONFIG — loaded from .env file
 # ═══════════════════════════════════════════════
@@ -146,23 +156,30 @@ async def fetch_all_posts(msg=None):
 # ═══════════════════════════════════════════════
 # FORMAT & SEND POST
 # ═══════════════════════════════════════════════
-def format_post(post, index, total):
+def format_post(post, index, total, limit=1024):
     created = post.get("created_time", "")
-    if created:
+    try:
         dt = datetime.strptime(created, "%Y-%m-%dT%H:%M:%S%z")
         date_str = dt.strftime("%B %d, %Y %I:%M %p")
-    else:
+    except (ValueError, TypeError):
         date_str = "N/A"
 
     message = post.get("message") or post.get("story") or "No caption"
-
-    return (
+    head = (
         f"📌 <b>POST #{index} of {total}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗓️ <b>Date:</b> {date_str}\n\n"
-        f"📝 <b>Caption:</b>\n{message}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"🗓️ <b>Date:</b> {esc(date_str)}\n\n"
+        f"📝 <b>Caption:</b>\n"
     )
+    foot = "\n━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # escape, then trim so the escaped text fits Telegram's limit
+    room = limit - len(head) - len(foot) - 60
+    msg = esc(message)
+    while len(msg) > room:
+        message = message[: int(len(message) * 0.9)]
+        msg = esc(message.rstrip()) + "…"
+    return head + msg + foot
 
 def get_post_url(post):
     post_id = post.get("id", "")
@@ -175,44 +192,49 @@ def get_post_image(post):
     return post.get("full_picture")
 
 async def send_post(context, chat_id, post, index, total):
-    caption   = format_post(post, index, total)
+    """Returns True if fully sent with image, False if image failed. Raises only if even text fails."""
+    bot       = context.bot
     post_url  = get_post_url(post)
     image_url = get_post_image(post)
-
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 View Post on Facebook", url=post_url)]
     ])
+    reason = None
 
-    try:
-        if image_url:
-            # Download image first, then send
+    # 1) photo + caption (max 1024 chars)
+    if image_url:
+        try:
+            caption = format_post(post, index, total, 1024)
             async with aiohttp.ClientSession() as session:
                 async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        image_bytes = await resp.read()
-                        await context.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=image_bytes,  # ← send bytes not URL
-                            caption=caption,
-                            parse_mode="HTML",
-                            reply_markup=markup
-                        )
-                    else:
+                    if resp.status != 200:
                         raise Exception(f"Image HTTP {resp.status}")
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id, text=caption,
-                parse_mode="HTML", reply_markup=markup
-            )
-    except Exception as e:
-        # Fallback — send as text only
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{caption}\n\n⚠️ <i>Image failed to load</i>",
-            parse_mode="HTML",
-            reply_markup=markup
-        )
-        save_failed_post(post, reason=str(e))
+                    image_bytes = await resp.read()
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=image_bytes, caption=caption,
+                                     parse_mode="HTML", reply_markup=markup)
+            except BadRequest:  # bad markup -> plain text caption
+                await bot.send_photo(chat_id=chat_id, photo=image_bytes,
+                                     caption=strip_tags(caption)[:1024], reply_markup=markup)
+            return True
+        except Exception as e:
+            reason = e
+
+    # 2) text-only fallback (max 4096 chars)
+    text = format_post(post, index, total, 4096)
+    if reason:
+        text += "\n\n⚠️ <i>Image failed to load</i>"
+    try:
+        await bot.send_message(chat_id=chat_id, text=text,
+                               parse_mode="HTML", reply_markup=markup)
+    except BadRequest:  # fallback no longer depends on HTML
+        await bot.send_message(chat_id=chat_id, text=strip_tags(text)[:4096],
+                               reply_markup=markup)
+
+    if reason:
+        save_failed_post(post, reason=reason)
+        return False
+    return True
 
 # ═══════════════════════════════════════════════
 # TOKEN STATUS
@@ -261,9 +283,9 @@ async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔑 <b>Token Status</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟢 Status     : <b>{status_icon}</b>\n"
-            f"📱 App        : <code>{app_name}</code>\n"
+            f"📱 App        : <code>{esc(app_name)}</code>\n"
             f"⏳ Expires    : {expiry_str}\n"
-            f"🔐 Permissions: <code>{scope_str}</code>\n"
+            f"🔐 Permissions: <code>{esc(scope_str)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + ("✅ Token is good to use!" if is_valid else
                "❌ Token is invalid! Please update your PAGE_ACCESS_TOKEN."),
@@ -271,7 +293,7 @@ async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await msg.edit_text(
-            f"❌ <b>Failed to check token</b>\n\nError: <code>{str(e)[:200]}</code>",
+            f"❌ <b>Failed to check token</b>\n\nError: <code>{esc(str(e)[:200])}</code>",
             parse_mode="HTML"
         )
 
@@ -372,6 +394,7 @@ async def resume_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No saved progress. Use /getposts to start.")
         return
 
+    context.bot_data["stop"] = False
     await update.message.reply_text(
         f"▶️ Resuming from post #{last + 1} of {total}...\nSend /stop anytime to pause."
     )
@@ -460,10 +483,12 @@ async def get_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["is_running"] = False
         await msg.edit_text(
             f"❌ <b>Failed to fetch posts</b>\n\n"
-            f"⚠️ Error: <code>{str(e)[:200]}</code>\n\n"
+            f"⚠️ Error: <code>{esc(str(e)[:200])}</code>\n\n"
             f"Make sure your Page Access Token is valid.",
             parse_mode="HTML"
         )
+    finally:
+        context.bot_data["is_running"] = False
 
 async def confirm_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -487,37 +512,43 @@ async def _send_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, st
         return
 
     total = len(posts)
+    context.bot_data["is_running"] = True
     save_progress(start_from, total)
+    try:
+        for i in range(start_from, total):
+            if context.bot_data.get("stop"):
+                save_progress(i, total)
+                context.bot_data["is_running"] = False
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏹️ <b>Stopped at post #{i + 1} of {total}</b>\nUse /resume to continue.",
+                    parse_mode="HTML"
+                )
+                return
 
-    for i in range(start_from, total):
-        if context.bot_data.get("stop"):
-            save_progress(i, total)
-            context.bot_data["is_running"] = False
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⏹️ <b>Stopped at post #{i + 1} of {total}</b>\nUse /resume to continue.",
-                parse_mode="HTML"
-            )
-            return
+            post  = posts[i]
+            index = i + 1
 
-        post  = posts[i]
-        index = i + 1
+            try:
+                await send_post(context, chat_id, post, index, total)
+                save_sent_id(post["id"])       # ← saved to Supabase
+                save_progress(index, total)    # ← saved to Supabase
+            except Exception as e:
+                    print(f"Skipping post {post.get('id')}: {e}")
+                    save_failed_post(post, reason=e)
 
-        await send_post(context, chat_id, post, index, total)
-        save_sent_id(post["id"])       # ← saved to Supabase
-        save_progress(index, total)    # ← saved to Supabase
+            await asyncio.sleep(1.5)
 
-        await asyncio.sleep(1.5)
-
-    clear_progress()
-    context.bot_data["is_running"] = False
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🎉 <b>All {total} new post(s) sent!</b>\n\n"
-             f"✅ Next time you run /getposts, only brand-new posts will be sent.",
-        parse_mode="HTML"
-    )
-
+        clear_progress()
+        context.bot_data["is_running"] = False
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎉 <b>All {total} new post(s) sent!</b>\n\n"
+                f"✅ Next time you run /getposts, only brand-new posts will be sent.",
+            parse_mode="HTML"
+        )
+    finally:
+        context.bot_data["is_running"] = False
 # ═══════════════════════════════════════════════
 # AUTO DAILY FETCH — runs at 11:59 PM PH time
 # ═══════════════════════════════════════════════
@@ -591,9 +622,14 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
                 return
 
             post = new_posts[i]
-            await send_post(context, chat_id, post, i + 1, total)
-            save_sent_id(post["id"])
-            save_progress(i + 1, total)
+            try:
+                await send_post(context, chat_id, post, i + 1, total)
+                save_sent_id(post["id"])
+                save_progress(i + 1, total)
+            except Exception as e:
+                print(f"Skipping post {post.get('id')}: {e}")
+                save_failed_post(post, reason=e)
+
             await asyncio.sleep(1.5)
 
         clear_progress()
@@ -611,7 +647,7 @@ async def auto_get_posts(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ <b>Nightly Auto-Fetch Failed</b>\n\n"
-                 f"⚠️ Error: <code>{str(e)[:200]}</code>",
+                 f"⚠️ Error: <code>{esc(str(e)[:200])}</code>",
             parse_mode="HTML"
         )
 
@@ -638,11 +674,15 @@ async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, row in enumerate(failed):
         post = json.loads(row["post_data"])
         try:
-            await send_post(context, chat_id, post, i + 1, total)
+            ok = await send_post(context, chat_id, post, i + 1, total)
+        except Exception:
+            ok = False
+
+        if ok:
             save_sent_id(post["id"])
             remove_failed_post(post["id"])
             success += 1
-        except Exception as e:
+        else:
             still_failed += 1
 
         await asyncio.sleep(1.5)
